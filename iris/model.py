@@ -12,6 +12,8 @@ class Iris(nn.Module):
     Each example contains one video. Variable-length examples are forwarded separately
     within a microbatch. This reference implementation prioritizes explicit alignment.
     """
+    accepts_loss_kwargs = False
+
     def __init__(self, backbone, token_ids, cfg=None):
         super().__init__()
         self.backbone, self.token_ids = backbone, token_ids
@@ -109,16 +111,18 @@ class Iris(nn.Module):
                 return grad * mask[:,None]
             self._embedding_hook = weight.register_hook(mask_grad)
 
-    def optimizer_groups(self, stage):
+    def optimizer_groups(self, stage, learning_rates=None, weight_decay=.01):
+        rates = learning_rates or ({'alignment':2e-4} if stage==2 else {'pose':2e-5,'person':3e-5,'binding':3e-5,'llm':1e-5})
         groups = {}
         embedding = self.backbone.get_input_embeddings().weight
         for name,p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            lr = 2e-4 if stage==2 else (3e-5 if name=='pose_encoder.person' else 2e-5 if name.startswith('pose_encoder') else
-                 3e-5 if name.startswith(('binding','projector')) else 1e-5)
+            lr = rates['alignment'] if stage==2 else (rates['person'] if name=='pose_encoder.person' else
+                 rates['pose'] if name.startswith('pose_encoder') else
+                 rates['binding'] if name.startswith(('binding','projector')) else rates['llm'])
             # No AdamW decay on frozen vocabulary rows, even with zero gradient.
-            decay = 0.0 if (stage==2 and p is embedding) else .01
+            decay = 0.0 if (stage==2 and p is embedding) else weight_decay
             groups.setdefault((lr,decay),[]).append(p)
         return [{'params':v,'lr':k[0],'weight_decay':k[1]} for k,v in groups.items()]
 

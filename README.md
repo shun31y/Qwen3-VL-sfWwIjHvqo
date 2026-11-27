@@ -1,3 +1,5 @@
+> **Unofficial Iris reproduction:** See [IRIS.md](IRIS.md) for the implementation, paper correspondence, data format, training/inference commands, tests, and known reproduction gaps. No training results are claimed.
+
 # Qwen3-VL
 
 

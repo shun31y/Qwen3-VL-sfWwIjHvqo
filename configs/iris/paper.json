@@ -1,0 +1,23 @@
+{
+  "source": "OpenReview sfWwIjHvqo, sections 3.2-3.6 and Appendix A/B",
+  "base_model": "Qwen/Qwen3-VL-8B-Instruct",
+  "rgb_frames": 16,
+  "pose_frames": 160,
+  "effective_visual_steps": 8,
+  "temporal_stride": 20,
+  "max_persons": 3,
+  "joints": 24,
+  "features_per_joint": 9,
+  "body_parts": 5,
+  "pose_layers": 8,
+  "binding_layers": 2,
+  "binding_width": 1024,
+  "position_offset": 100,
+  "stage1": {"epochs": 150, "batch_size": 512, "gpus": 1, "samples_approx": 30000},
+  "stage2": {"epochs": 2, "batch_size": 288, "gpus": 24, "samples_approx": 400000},
+  "stage3": {"epochs": 1, "batch_size": 288, "gpus": 24, "samples_approx": 550000},
+  "warmup_ratio": 0.05,
+  "weight_decay": 0.01,
+  "optimizer": "AdamW",
+  "scheduler": "cosine"
+}

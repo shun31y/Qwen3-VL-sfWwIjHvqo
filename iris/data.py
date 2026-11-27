@@ -4,9 +4,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from .model import SPECIAL
+from .modules import PoseConfig
 
 class Manifest(Dataset):
-    def __init__(self,path,processor=None,stage=3,inference=False):
+    def __init__(self,path,processor=None,stage=3,inference=False,pose_config=None):
+        self.cfg = pose_config or PoseConfig()
         self.inference = inference
         self.path = Path(path)
         self.rows = [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()]
@@ -22,7 +24,7 @@ class Manifest(Dataset):
         pose = None
         if row.get('pose'):
             pose = torch.from_numpy(np.load(self.resolve(row['pose']),allow_pickle=False)).float()
-            if pose.ndim!=4 or pose.shape[0]!=160 or pose.shape[-2:]!=(24,9) or pose.shape[1]>3 or not torch.isfinite(pose).all():
+            if pose.ndim!=4 or pose.shape[0]!=self.cfg.steps*self.cfg.clip or pose.shape[-2:]!=(24,9) or pose.shape[1]>self.cfg.persons or not torch.isfinite(pose).all():
                 raise ValueError('Expected finite pose [160,P<=3,24,9]')
             if pose.shape[1]==0 or not pose[...,8].any():
                 pose = None
@@ -32,13 +34,13 @@ class Manifest(Dataset):
             return {'pose':pose,'caption':row['caption']}
         if self.stage==2 and pose is None:
             raise ValueError('Stage 2 requires pose-paired data')
-        content = [{'type':'video','video':self.resolve(row['video']),'nframes':16},
+        content = [{'type':'video','video':self.resolve(row['video']),'nframes':self.cfg.steps*2},
                    {'type':'text','text':row['question']}]
         messages = [{'role':'user','content':content}]
         from qwen_vl_utils import process_vision_info
         # Pose block precedes question, after visual content.
         if pose is not None:
-            block = SPECIAL[0]+SPECIAL[2]*(8*pose.shape[1]*10)+SPECIAL[1]
+            block = SPECIAL[0]+SPECIAL[2]*(self.cfg.steps*pose.shape[1]*10)+SPECIAL[1]
             content.insert(1,{'type':'text','text':block})
         prefix = self.processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
         images,videos,kwargs = process_vision_info(messages,image_patch_size=16,return_video_kwargs=True,return_video_metadata=True)

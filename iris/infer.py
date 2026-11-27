@@ -24,7 +24,7 @@ def main():
     model.load_state_dict(torch.load(path/'iris.pt',map_location='cpu',weights_only=True))
     dtype=torch.bfloat16 if args.device.startswith('cuda') else torch.float32
     model.to(device=args.device,dtype=dtype).eval()
-    dataset=Manifest(args.manifest,processor,inference=True)
+    dataset=Manifest(args.manifest,processor,inference=True,pose_config=model.cfg)
     with open(args.output,'w') as f:
         for i in range(len(dataset)):
             example={k:v.to(args.device) for k,v in dataset[i].items()}

@@ -2,7 +2,7 @@
 
 Implementation of **Iris: Empowering Video MLLMs with High-Frequency Pose Priors via Spatiotemporal Binding**, Zhang et al., [OpenReview sfWwIjHvqo](https://openreview.net/forum?id=sfWwIjHvqo). Based on the supplied 31-page manuscript, especially §§3.2–3.6 and Appendices A/B. This is independent code, not the authors' release. The paper PDF is not redistributed.
 
-This repository is a public fork of QwenLM/Qwen3-VL at `96588727e44c78b25ba03ea03b8e12f7e64fd0da`. Upstream files remain available; the implementation is in `iris/`. No training or pretrained-weight download was performed when preparing this implementation. Numerical reproduction has **not** been established.
+This repository is a public fork of QwenLM/Qwen3-VL at `96588727e44c78b25ba03ea03b8e12f7e64fd0da`. Upstream files remain available; the implementation is in `iris/`. No full-data training or pretrained-weight download was performed when preparing this implementation; only synthetic optimizer-step tests were run. Numerical reproduction has **not** been established.
 
 ## Implemented correspondence
 
@@ -61,29 +61,70 @@ The NPZ contains `uv [T,P,24,2]` in pixels, `xyz [T,P,24,3]`, `translation [T,P,
 
 **External prerequisites:** GroundingDINO/SAM3/SAM-3D-Body detection, tracking and raw keypoint extraction are not bundled or automatically downloaded. Supply estimator exports or ready pose arrays. This repository implements the deterministic descriptor/postprocessing and MLLM side, not an end-to-end raw-video estimator stack. The paper's private ~550K mixture, ~30K motion captions, proxy labels, and author checkpoints are not included. Their exact reconstruction cannot be guaranteed from the manuscript. At test time do not use MLLM-based pose correction, manual filtering or benchmark answers.
 
-## Progressive training (commands only; not executed)
+## Config-driven progressive training
+
+The runnable recipes are [stage1.json](configs/iris/stage1.json), [stage2.json](configs/iris/stage2.json), and [stage3.json](configs/iris/stage3.json). `paper.json` is a reference summary; the trainer reads the stage recipes. This replaces the earlier `--stage/--manifest/--output` CLI.
+
+All manifest, output, previous-stage, and DeepSpeed paths resolve relative to the recipe file. Model/BERT values are Hugging Face IDs or local paths; prefer absolute paths for local models. Copy a recipe and edit paths for your dataset. Validate the schema and inspect resolved settings without downloading weights:
 
 ```bash
-python -m iris.train --stage 1 --manifest data/stage1.jsonl --output outputs/stage1 --bf16
-
-# Install DeepSpeed separately for distributed training.
-# On each of 3 nodes, use its NODE_RANK; set MASTER_ADDR to node 0.
-torchrun --nnodes=3 --nproc_per_node=8 --node_rank=$NODE_RANK \
-  --master_addr=$MASTER_ADDR --master_port=29500 \
-  -m iris.train --stage 2 --manifest data/stage2.jsonl \
-  --previous outputs/stage1 --output outputs/stage2 --bf16 \
-  --deepspeed configs/iris/zero2.json
-
-torchrun --nnodes=3 --nproc_per_node=8 --node_rank=$NODE_RANK \
-  --master_addr=$MASTER_ADDR --master_port=29500 \
-  -m iris.train --stage 3 --manifest data/stage3.jsonl \
-  --previous outputs/stage2 --output outputs/stage3 --bf16 \
-  --deepspeed configs/iris/zero2.json
+python -m iris.train --config configs/iris/stage1.json --validate-only
+python -m iris.train --config configs/iris/stage2.json --validate-only
+python -m iris.train --config configs/iris/stage3.json --validate-only
 ```
 
-Defaults follow Table 8: epochs 150/2/1; batch 512 in stage 1, per-device 12 in stages 2/3 (global 288 over 24 GPUs); cosine with 5% warmup; weight decay .01; gradient clipping 1. Stage 1 LRs: pose 1e-4, BERT 1e-5, contrastive heads 3e-4. Stage 2 LR 2e-4; pose/vision/LLM frozen except new input embeddings. Stage 3 LRs: pose 2e-5, person embeddings/binding/projector 3e-5, backbone 1e-5; vision remains frozen. Old vocabulary rows have zero gradient and zero weight decay in stage 2. Each new stage creates a fresh optimizer; `--resume` resumes within a stage.
+With prepared manifests/pose arrays and model access, run the stages in order:
 
-Variable-length examples are forwarded separately inside each local microbatch, then their losses are averaged. This is slower than a packed implementation. Multi-node/DeepSpeed execution and full-size 8B memory use have not been tested. Stage 1 is intended for the paper's single-GPU setup; distributed global-negative gathering is not implemented. Training writes a full `iris.pt`, a transferable `pose_encoder.pt`, processor files, and model/config provenance. Full checkpoints are large.
+```bash
+# One GPU; jointly trains BERT, pose encoder and contrastive heads.
+CUDA_VISIBLE_DEVICES=0 python -m iris.train --config configs/iris/stage1.json
+
+# Install DeepSpeed separately. Run each command on all 3 nodes with ranks 0,1,2.
+# MASTER_ADDR is node 0; all nodes need the same data and checkpoint paths.
+torchrun --nnodes=3 --nproc_per_node=8 --node_rank=$NODE_RANK \
+  --master_addr=$MASTER_ADDR --master_port=29500 \
+  -m iris.train --config configs/iris/stage2.json
+
+torchrun --nnodes=3 --nproc_per_node=8 --node_rank=$NODE_RANK \
+  --master_addr=$MASTER_ADDR --master_port=29500 \
+  -m iris.train --config configs/iris/stage3.json
+
+# Resume an interrupted stage, including optimizer, scheduler and RNG states.
+python -m iris.train --config configs/iris/stage1.json \
+  --resume outputs/stage1/checkpoint-100
+```
+
+### Paper settings and executable controls
+
+| Setting | Stage 1 | Stage 2 | Stage 3 |
+|---|---|---|---|
+| Objective | Symmetric pose/BERT InfoNCE | Answer next-token loss | Answer next-token loss |
+| Epochs | 150 | 2 | 1 |
+| GPUs / per-device batch / accumulation | 1 / 512 / 1 | 24 / 12 / 1 | 24 / 12 / 1 |
+| Effective batch | 512 | 288 | 288 |
+| Pose LR | 1e-4 | frozen | 2e-5 |
+| BERT LR | 1e-5 | absent | absent |
+| Contrastive heads LR | 3e-4 | absent | absent |
+| Projector/binding LR | absent | 2e-4 | 3e-5 |
+| Person embedding LR | pose LR | frozen | 3e-5 |
+| LLM LR | absent | frozen except new input rows at 2e-4 | 1e-5 |
+| Vision encoder | absent | frozen | frozen |
+
+AdamW, cosine scheduling, 5% warmup, weight decay .01 and gradient clipping 1 are explicit recipe fields. The recipes also expose all `PoseConfig` fields, BERT ID, projection dimension, initial temperature, maximum caption length and seed. `learning_rates` drives optimizer groups, rather than serving as documentation only. In stage 2 the embedding parameter has zero decay, protecting frozen old vocabulary rows despite AdamW's decoupled decay.
+
+Runtime checks enforce the configured world size and effective batch before loading weights. Stage 1 rejects distributed execution and gradient accumulation because its InfoNCE negatives are computed within a single batch; accumulating small batches would not reproduce 512-way contrastive training. `drop_last=true` keeps full-size batches and avoids singleton contrastive losses. Reducing world size or batch sizes requires an explicitly changed config and is not the published recipe.
+
+### Artifacts and stage transitions
+
+Stage 1 writes `contrastive.pt` containing **BERT, pose encoder, both projection heads and temperature**, plus `pose_encoder.pt` for stage 2 and a saved BERT tokenizer. Stage 2 loads the stage-1 pose weights and freezes them. Stage 3 loads all of stage 2's `iris.pt` and its saved processor, then unfreezes the appropriate modules. The loader verifies the preceding stage number, pose architecture, and (for stage 3) base-model identity and special-token IDs.
+
+Every completed stage writes `resolved_config.json`, `iris_config.json` (including the manifest SHA-256), and Trainer state. Intermediate `checkpoint-*` directories contain model, optimizer, scheduler, RNG/Trainer states and `experiment.json`. Resumption verifies the same recipe (output directory may differ) and manifest hash. Stage transitions intentionally use a fresh optimizer. The manifest hash does not hash referenced videos/arrays or remote model revisions; preserve those assets separately. Pin model revisions by using immutable local snapshots if strict artifact identity is required.
+
+### What has actually been verified
+
+`tests/iris/test_training.py` runs the real Hugging Face Trainer on CPU with tiny locally initialized BERT and Qwen3-VL models. It verifies BERT weight updates, full stage-1 checkpoint contents, an interrupted/resumed stage-1 run matching uninterrupted final weights, exact stage-1→2 and stage-2→3 weight transfer, frozen pose/vision weights in stage 2, and pose/LLM updates with vision frozen in stage 3. Each stage executes two synthetic optimizer steps. Stage 1 reads actual JSONL/NPY files and tokenizes captions with BERT; stage 2/3 substitute a prepared synthetic video dataset and processor so these tests require no downloaded weights or video corpus.
+
+These smoke tests are not full training. The paper-size BERT/8B runs, 24-GPU DeepSpeed execution, real-data convergence, and published benchmark scores remain unverified. Variable-length examples are forwarded separately inside each local stage-2/3 microbatch and their losses averaged; this reference implementation is slower than a packed trainer. The author dataset/proxy QA construction remains external. BERT variant/pooling, pose width/heads, projection dimension, temperature, precision (BF16), ZeRO stage 2, seed, caption length and tail-batch handling are explicit implementation choices where the manuscript does not fully specify them.
 
 ## Inference and scoring
 
@@ -225,4 +266,4 @@ Stage 1では人物paddingを平均の分母から除外します。stage間は 
 
 姿勢なし・全不可視・人物数ゼロの入力はデータ層でRGB-onlyへ切り替えます。`test_rgb_fallback_identical` は同一backboneへ直接入力した場合と出力が一致することを確認します。`test_multi_person_and_checkpoint` は3人物とcheckpointの保存・復元を、`test_invalid_slot_count` は姿勢トークン数の不一致検出を確認します。`test_inference_manifest_never_includes_answer` は推論入力へ正解文を連結しないことを確認します。
 
-既存の10テストは実装の整合性の根拠です。論文の各貢献による精度向上を確かめるには、同じデータ・学習条件でRGB-only、時間結合なし、空間結合なし、姿勢密度変更などのablationが別途必要です。このドキュメント追加ではコード変更・追加訓練・ベンチマーク評価は行っていません。
+モデルの単体テストと上記の学習統合テストは実装の整合性の根拠です。論文の各貢献による精度向上を確かめるには、同じデータ・学習条件でRGB-only、時間結合なし、空間結合なし、姿勢密度変更などのablationが別途必要です。その後のconfig対応では小型モデルの合成データで各Stageのoptimizer更新・保存・引き継ぎとStage 1の再開を検証しています。本訓練・ベンチマーク評価は行っていません。
